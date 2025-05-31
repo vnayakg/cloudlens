@@ -30,7 +30,6 @@ type credentialProvider struct {
 type AWSConfigInput struct {
 	Profile, Region string
 	UseLocalStack   bool
-	UseEnvVariables bool
 }
 
 func (c credentialProvider) Retrieve() (credentials.Value, error) {
@@ -42,67 +41,96 @@ func (c credentialProvider) IsExpired() bool {
 }
 
 func GetCfg(cfgInput AWSConfigInput) (awsV2.Config, error) {
-
 	var cfg awsV2.Config
 	var err error
+	var loadOptions []func(*awsV2Config.LoadOptions) error
 
+	// Handle LocalStack separately if needed.
+	// For this refactoring, we assume UseLocalStack might be handled upstream
+	// or integrated differently. If it's still a primary concern for this function,
+	// it would need to be the first check.
 	if cfgInput.UseLocalStack {
 		cfg, err = GetLocalstackCfg(cfgInput.Region)
-	} else if cfgInput.UseEnvVariables {
-		cfg, err = GetCfgUsingEnvVariables(cfgInput.Profile, cfgInput.Region)
-	} else {
-		cfg, err = awsV2Config.LoadDefaultConfig(
-			context.TODO(),
-			awsV2Config.WithSharedConfigProfile(cfgInput.Profile),
-			awsV2Config.WithRegion(cfgInput.Region),
-		)
+		if err != nil {
+			log.Print("failed to load LocalStack config: ", err)
+			return awsV2.Config{}, fmt.Errorf("failed to load LocalStack config: %w", err)
+		}
+		// Early return for LocalStack as its configuration is distinct.
+		return cfg, nil
 	}
 
-	if err != nil {
-		log.Print("failed to load config")
-		return awsV2.Config{}, err
-	}
-	creds, err := cfg.Credentials.Retrieve(context.TODO())
-	if err != nil {
-		log.Print("failed to read credentials ", err)
-		return awsV2.Config{}, err
+	// Region configuration
+	if cfgInput.Region != "" {
+		loadOptions = append(loadOptions, awsV2Config.WithRegion(cfgInput.Region))
 	}
 
-	credentialProvider := credentialProvider{Credentials: creds}
+	// 1. Use profile from cfgInput.Profile if provided
+	if cfgInput.Profile != "" {
+		log.Print(fmt.Sprintf("Attempting to load configuration with profile: %s", cfgInput.Profile))
+		profileLoadOptions := append(loadOptions, awsV2Config.WithSharedConfigProfile(cfgInput.Profile))
+		cfg, err = awsV2Config.LoadDefaultConfig(context.TODO(), profileLoadOptions...)
+		if err == nil {
+			_, credErr := cfg.Credentials.Retrieve(context.TODO())
+			if credErr == nil {
+				log.Print(fmt.Sprintf("Successfully loaded configuration with profile: %s", cfgInput.Profile))
+				return cfg, nil
+			}
+			log.Print(fmt.Sprintf("Failed to retrieve credentials with profile %s: %v", cfgInput.Profile, credErr))
+			// Fall through if profile credentials fail, to allow other methods
+		} else {
+			log.Print(fmt.Sprintf("Failed to load configuration with profile %s: %v", cfgInput.Profile, err))
+			// Fall through to try other methods
+		}
+	}
+
+	// 2. Use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables if set
+	awsAccessKeyID := os.Getenv("AWS_ACCESS_KEY_ID")
+	awsSecretAccessKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	awsSessionToken := os.Getenv("AWS_SESSION_TOKEN") // Optional
+
+	if awsAccessKeyID != "" && awsSecretAccessKey != "" {
+		log.Print("Attempting to load configuration using environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)")
+		envLoadOptions := append(loadOptions, awsV2Config.WithCredentialsProvider(
+			creds.NewStaticCredentialsProvider(awsAccessKeyID, awsSecretAccessKey, awsSessionToken),
+		))
+		cfg, err = awsV2Config.LoadDefaultConfig(context.TODO(), envLoadOptions...)
+		if err == nil {
+			_, credErr := cfg.Credentials.Retrieve(context.TODO())
+			if credErr == nil {
+				log.Print("Successfully loaded configuration using environment variables.")
+				return cfg, nil
+			}
+			log.Print(fmt.Sprintf("Failed to retrieve credentials with environment variables: %v", credErr))
+			// Fall through if env var credentials fail
+		} else {
+			log.Print(fmt.Sprintf("Failed to load configuration with environment variables: %v", err))
+			// Fall through to try other methods
+		}
+	}
+
+	// 3. Otherwise, use the default AWS profile/chain
+	log.Print("Attempting to load configuration using default AWS profile/chain.")
+	cfg, err = awsV2Config.LoadDefaultConfig(context.TODO(), loadOptions...)
+	if err != nil {
+		log.Print("Failed to load default AWS configuration: ", err)
+		return awsV2.Config{}, fmt.Errorf("failed to load any AWS configuration: %w", err)
+	}
+
+	// Validate credentials once a configuration is potentially loaded
+	finalCreds, err := cfg.Credentials.Retrieve(context.TODO())
+	if err != nil {
+		log.Print("Failed to retrieve credentials from the loaded AWS config: ", err)
+		return awsV2.Config{}, fmt.Errorf("failed to retrieve credentials from loaded config: %w", err)
+	}
+
+	credentialProvider := credentialProvider{Credentials: finalCreds}
 	if credentialProvider.IsExpired() {
-		log.Print("Credentials have expired")
-		return awsV2.Config{}, errors.New("AWS Credentials expired")
-	}
-	return cfg, err
-}
-
-func GetCfgUsingEnvVariables(profile, region string) (awsV2.Config, error) {
-	akid := aws.String(os.Getenv(AWS_ACCESS_KEY_ID))
-	secKey := aws.String(os.Getenv(AWS_SECRET_ACCESS_KEY))
-	cfg, err := awsV2Config.LoadDefaultConfig(
-		context.TODO(),
-		awsV2Config.WithSharedConfigProfile(profile),
-		awsV2Config.WithRegion(region),
-		config.WithCredentialsProvider(
-			creds.NewStaticCredentialsProvider(*akid, *secKey, ""),
-		),
-	)
-	if err != nil {
-		log.Print("failed to load config")
-		return awsV2.Config{}, err
-	}
-	creds, err := cfg.Credentials.Retrieve(context.TODO())
-	if err != nil {
-		log.Print("failed to read credentials ", err)
-		return awsV2.Config{}, err
+		log.Print("AWS Credentials have expired.")
+		return awsV2.Config{}, errors.New("AWS credentials expired")
 	}
 
-	credentialProvider := credentialProvider{Credentials: creds}
-	if credentialProvider.IsExpired() {
-		log.Print("Credentials have expired")
-		return awsV2.Config{}, errors.New("AWS Credentials expired")
-	}
-	return cfg, err
+	log.Print("Successfully loaded AWS configuration.")
+	return cfg, nil
 }
 
 func GetProfiles() (profiles []string, err error) {
