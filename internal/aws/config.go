@@ -11,7 +11,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	awsV2Config "github.com/aws/aws-sdk-go-v2/config"
 	creds "github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/one2nc/cloudlens/internal"

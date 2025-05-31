@@ -118,7 +118,7 @@ func (a *App) handleAWS() {
 			profiles = []string{*profile}
 			region := awsS.String(os.Getenv(internal.AWS_DEFAULT_REGION))
 			regions = []string{*region}
-			awsConfigInput.UseEnvVariables = true
+			// awsConfigInput.UseEnvVariables was removed
 		}
 	}
 
