@@ -204,12 +204,11 @@ region = us-west-2` // This region should be overridden
 
 		_, err := GetCfg(cfgInput)
 		assert.Error(t, err)
-		// Error message might vary depending on SDK version and what it tried first.
-		// It should indicate that loading configuration or credentials failed.
-		// Example: "failed to load configuration with profile invalid-profile-does-not-exist: ..."
-		// Or "failed to load any AWS configuration: ..."
 		t.Logf("Received error for invalid profile: %v", err)
-		assert.True(t, strings.Contains(err.Error(), "failed to load any AWS configuration") || strings.Contains(err.Error(), "SharedConfigProfile"))
+		// Error message from GetCfg when credential retrieval fails.
+		assert.Contains(t, err.Error(), "failed to retrieve or validate AWS credentials", "Error should indicate failure to retrieve/validate credentials")
+		// When AWS_EC2_METADATA_DISABLED=true is set globally, the SDK error should reflect that.
+		assert.Contains(t, err.Error(), "access disabled to EC2 IMDS", "Underlying SDK error should mention IMDS is disabled")
 	})
 
 	t.Run("Error on Missing Credentials entirely", func(t *testing.T) {
@@ -231,10 +230,11 @@ region = us-west-2` // This region should be overridden
 
 		_, err := GetCfg(cfgInput)
 		assert.Error(t, err)
-		// This error usually indicates that the SDK couldn't find any credentials
-		// in the default chain (env, shared config/credentials).
 		t.Logf("Received error for missing credentials: %v", err)
-		assert.True(t, strings.Contains(err.Error(), "failed to retrieve credentials") || strings.Contains(err.Error(), "no valid credentials"))
+		// Error message from GetCfg when credential retrieval fails.
+		assert.Contains(t, err.Error(), "failed to retrieve or validate AWS credentials", "Error should indicate failure to retrieve/validate credentials")
+		// When AWS_EC2_METADATA_DISABLED=true is set globally, the SDK error should reflect that.
+		assert.Contains(t, err.Error(), "access disabled to EC2 IMDS", "Underlying SDK error should mention IMDS is disabled")
 	})
 
 	t.Run("SDK picks up region from AWS_REGION env var if not in cfgInput and not in profile", func(t *testing.T) {
@@ -268,10 +268,45 @@ output = json`
 		assert.NoError(t, err)
 		assert.Equal(t, "default_key_for_region_test", creds.AccessKeyID)
 	})
+
+	t.Run("cfgInput.Region_overrides_AWS_REGION_env_var", func(t *testing.T) {
+		dummyCredsContent := `[default]
+aws_access_key_id = dummy_key_for_region_override_test
+aws_secret_access_key = dummy_secret_for_region_override_test`
+		credsFile, credsCleanup := createDummyCredentialsFile(t, dummyCredsContent)
+		defer credsCleanup()
+
+		// Config file can be minimal, region is not the focus here beyond ensuring it loads
+		dummyConfigContent := `[default]
+output = json`
+		configFile, configCleanup := createDummyConfigFile(t, dummyConfigContent)
+		defer configCleanup()
+
+		os.Setenv("AWS_SHARED_CREDENTIALS_FILE", credsFile)
+		os.Setenv("AWS_CONFIG_FILE", configFile)
+		os.Setenv("AWS_REGION", "ap-northeast-1") // This AWS_REGION env var should be overridden
+		os.Unsetenv("AWS_ACCESS_KEY_ID")          // Ensure no direct env var creds interfere
+		os.Unsetenv("AWS_SECRET_ACCESS_KEY")
+		os.Unsetenv("AWS_PROFILE") // Ensure no profile env var interferes
+
+		cfgInputRegion := "eu-west-2"
+		cfgInput := AWSConfigInput{Region: cfgInputRegion} // This region in input should take precedence
+
+		awsCfg, err := GetCfg(cfgInput)
+		assert.NoError(t, err)
+		assert.NotNil(t, awsCfg)
+		assert.Equal(t, cfgInputRegion, awsCfg.Region, "Region from cfgInput should override AWS_REGION env var")
+
+		// Verify credentials still load to ensure config is otherwise valid
+		_, credErr := awsCfg.Credentials.Retrieve(context.TODO())
+		assert.NoError(t, credErr, "Credentials should still load even when overriding region")
+	})
 }
 
 func TestGetCfg_LocalStack(t *testing.T) {
+	// Set LocalStack port first
 	originalPort := os.Getenv("LOCALSTACK_PORT")
+	os.Setenv("LOCALSTACK_PORT", "4566")
 	defer func() {
 		if originalPort == "" {
 			os.Unsetenv("LOCALSTACK_PORT")
@@ -280,7 +315,16 @@ func TestGetCfg_LocalStack(t *testing.T) {
 		}
 	}()
 
-	os.Setenv("LOCALSTACK_PORT", "4566")
+	// Prevent IMDS lookups for hermetic tests, done after LocalStack port setup
+	originalIMDS := os.Getenv("AWS_EC2_METADATA_DISABLED")
+	os.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Cleanup(func() {
+		if originalIMDS == "" {
+			os.Unsetenv("AWS_EC2_METADATA_DISABLED")
+		} else {
+			os.Setenv("AWS_EC2_METADATA_DISABLED", originalIMDS)
+		}
+	})
 
 	cfgInput := AWSConfigInput{
 		UseLocalStack: true,
@@ -293,20 +337,18 @@ func TestGetCfg_LocalStack(t *testing.T) {
 	assert.Equal(t, "us-east-1", awsCfg.Region)
 
 	// For LocalStack, the endpoint resolver is the key.
-	// We can't directly inspect the resolver function easily,
-	// but we can check if it resolves to a LocalStack-like URL.
-	endpoint, err := awsCfg.EndpointResolverWithOptions.ResolveEndpoint("s3", "us-east-1")
+	assert.NotNil(t, awsCfg.EndpointResolver, "EndpointResolver should be set for LocalStack")
+	endpoint, err := awsCfg.EndpointResolver.ResolveEndpoint("s3", "us-east-1")
 	assert.NoError(t, err)
-	assert.Contains(t, endpoint.URL, "localhost:4566", "Endpoint URL should point to LocalStack")
+	assert.Contains(t, endpoint.URL, "http://localhost:4566", "Endpoint URL should point to LocalStack, including scheme")
+	assert.Equal(t, "us-east-1", endpoint.SigningRegion, "SigningRegion should match resolved region")
 
-	// Credentials for LocalStack are often dummy/test values or not strictly checked by LocalStack itself.
-	// The default SDK behavior might still try to load some credentials,
-	// but LocalStack typically doesn't validate them.
-	// Depending on the SDK's default behavior when no explicit creds are found,
-	// this might or might not return an error. For basic LocalStack usage,
-	// the endpoint matters more than the specific credentials.
-	_, credErr := awsCfg.Credentials.Retrieve(context.TODO())
-	assert.NoError(t, credErr, "Retrieving credentials for LocalStack config should not fail, even if they are dummy/anonymous")
+	// Credentials for LocalStack are explicitly set to static "local"/"local"/"local" by GetLocalstackCfg
+	creds, credErr := awsCfg.Credentials.Retrieve(context.TODO())
+	assert.NoError(t, credErr, "Retrieving credentials for LocalStack config should not fail")
+	assert.Equal(t, "local", creds.AccessKeyID, "AccessKeyID for LocalStack should be 'local'")
+	assert.Equal(t, "local", creds.SecretAccessKey, "SecretAccessKey for LocalStack should be 'local'")
+	assert.Equal(t, "local", creds.SessionToken, "SessionToken for LocalStack should be 'local'")
 }
 
 // Note: To make these tests fully hermetic and avoid REAL AWS calls if dummy files/env vars are misconfigured:
@@ -319,9 +361,9 @@ func TestGetCfg_LocalStack(t *testing.T) {
 //   interfere between test runs (the current `GetCfg` looks safe in this regard).
 
 // Helper to print credentials for debugging
-func printCreds(t *testing.T, creds awsV2.Credentials, desc string) {
+func printCreds(t *testing.T, credsProvider awsV2.CredentialsProvider, desc string) {
 	t.Helper()
-	retrieved, err := creds.Retrieve(context.TODO())
+	retrieved, err := credsProvider.Retrieve(context.TODO())
 	if err != nil {
 		t.Logf("[%s] Error retrieving creds: %v", desc, err)
 		return
